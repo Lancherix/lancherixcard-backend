@@ -5,25 +5,11 @@ import Recurring from "../models/Recurring.js";
 import Category from "../models/Category.js";
 import Goal from "../models/Goal.js";
 import Settings from "../models/Settings.js";
+import { parseDateString, formatDateUTC, resolveTodayParam } from "../utils/dateUtils.js";
+import { serializeCategory, serializeSettings } from "../utils/serializers.js";
+import { pruneOldData } from "../utils/retention.js";
 
 const router = express.Router();
-
-// Parses a "YYYY-MM-DD" string as a UTC date, and formats a Date back to
-// "YYYY-MM-DD" using UTC getters. Using UTC consistently on both ends here
-// (rather than the server's local getters) means the arithmetic below is
-// never affected by the server's own time zone — it only ever moves in
-// whole calendar days/months/years relative to the string it was given.
-function parseDateString(str) {
-  const [y, m, d] = str.split("-").map(Number);
-  return new Date(Date.UTC(y, m - 1, d));
-}
-
-function formatDateUTC(date) {
-  const y = date.getUTCFullYear();
-  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
-  const d = String(date.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
-}
 
 function advanceDate(dateStr, frequency) {
   const d = parseDateString(dateStr);
@@ -74,24 +60,22 @@ async function postDueRecurring(userId, today) {
   }
 }
 
-// One-shot fetch of everything AppContext needs to hydrate on load, instead
-// of five separate round trips. Shape mirrors the frontend's initialState
-// in AppContext.jsx so it can replace it directly.
+// One-shot fetch of everything AppContext needs to hydrate on load.
 //
-// ?today=YYYY-MM-DD — the client's local date, used to decide which
-// recurring items are due. Falls back to the server's own UTC date if
-// omitted or malformed, but the client should always send its local date
-// (see getLocalDateString in AppContext.js) so "due" matches what the user
-// actually sees on their calendar, not the server's.
+// ?today=YYYY-MM-DD — the client's local date. Used to decide which
+// recurring items are due, which calendar month is "current" for budget
+// writes, and where the 2-year retention cutoff sits. Falls back to the
+// server's own UTC date if omitted or malformed, but the client should
+// always send its local date (see getLocalDateString in AppContext.js).
 router.get("/", requireAuth, async (req, res) => {
   try {
     const { userId } = req;
+    const today = resolveTodayParam(req.query.today);
 
-    const todayParam = req.query.today;
-    const today = /^\d{4}-\d{2}-\d{2}$/.test(todayParam)
-      ? todayParam
-      : formatDateUTC(new Date());
-
+    // Retention first (drops anything from 2+ calendar years ago), then
+    // post today's due recurring items — due items are always recent, so
+    // ordering here doesn't matter for correctness, just tidiness.
+    await pruneOldData(userId, today);
     await postDueRecurring(userId, today);
 
     const [transactions, recurring, categories, goals, settings] = await Promise.all([
@@ -105,9 +89,12 @@ router.get("/", requireAuth, async (req, res) => {
     res.json({
       transactions,
       recurring,
-      categories,
+      categories: categories.map(serializeCategory),
       goals,
-      budget: { monthlyLimit: settings?.monthlyLimit ?? 0 },
+      // Full per-month history, keyed "YYYY-MM" — the frontend looks up
+      // whichever month is currently being viewed, exactly like it already
+      // does for income/expenses from the raw transaction list.
+      budgetHistory: settings ? serializeSettings(settings).monthlyLimits : {},
       currency: settings?.currencyCode
         ? { code: settings.currencyCode, exchangeRate: settings.exchangeRate }
         : null,

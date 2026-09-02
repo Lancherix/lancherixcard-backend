@@ -5,6 +5,8 @@ import Transaction from "../models/Transaction.js";
 import Recurring from "../models/Recurring.js";
 import Goal from "../models/Goal.js";
 import Category from "../models/Category.js";
+import { resolveTodayParam, getMonthKey } from "../utils/dateUtils.js";
+import { serializeSettings } from "../utils/serializers.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -21,40 +23,42 @@ async function getOrCreateSettings(userId) {
 
 router.get("/", async (req, res) => {
   const settings = await getOrCreateSettings(req.userId);
-  res.json(settings);
+  res.json(serializeSettings(settings));
 });
 
 router.patch("/budget", async (req, res) => {
-  const { monthlyLimit } = req.body;
+  const { monthlyLimit, today: todayParam } = req.body;
   if (typeof monthlyLimit !== "number" || monthlyLimit < 0) {
     return res.status(400).json({ message: "invalidAmount" });
   }
-  const settings = await Settings.findOneAndUpdate(
-    { userId: req.userId },
-    { monthlyLimit },
-    { new: true, upsert: true }
-  );
-  res.json(settings);
+
+  // Same rule as category limits: this writes only the CURRENT month's
+  // entry. Whatever was set for past months stays untouched - that's what
+  // makes them show up as history afterward.
+  const monthKey = getMonthKey(resolveTodayParam(todayParam));
+
+  const settings = await getOrCreateSettings(req.userId);
+  settings.monthlyLimits.set(monthKey, monthlyLimit);
+  await settings.save();
+  res.json(serializeSettings(settings));
 });
 
 // First-time currency pick — no conversion, nothing to rescale yet.
-// Mirrors SET_CURRENCY.
 router.post("/currency", async (req, res) => {
   const { code, exchangeRate } = req.body;
   if (!code) return res.status(400).json({ message: "missingCode" });
 
-  const settings = await Settings.findOneAndUpdate(
-    { userId: req.userId },
-    { currencyCode: code, exchangeRate: exchangeRate ?? 1 },
-    { new: true, upsert: true }
-  );
-  res.json(settings);
+  const settings = await getOrCreateSettings(req.userId);
+  settings.currencyCode = code;
+  settings.exchangeRate = exchangeRate ?? 1;
+  await settings.save();
+  res.json(serializeSettings(settings));
 });
 
 // Existing user switching currency later — rescales every stored amount by
-// `rate` (units of new currency per 1 unit of current currency), so the
-// user sees amounts of the right real-world size, not just relabeled
-// numbers. Mirrors CHANGE_CURRENCY.
+// `rate`, including EVERY month's entry in every budget-history map, not
+// just the current one, so past months stay comparable in the new currency
+// instead of silently drifting out of scale.
 router.post("/currency/change", async (req, res) => {
   try {
     const { code, rate } = req.body;
@@ -71,6 +75,17 @@ router.post("/currency/change", async (req, res) => {
       getOrCreateSettings(userId),
     ]);
 
+    const rescaleMap = (map) => {
+      for (const [key, value] of map.entries()) {
+        map.set(key, round2(value * r));
+      }
+    };
+
+    rescaleMap(settings.monthlyLimits);
+    settings.currencyCode = code;
+    settings.exchangeRate = r;
+    categories.forEach((c) => rescaleMap(c.limits));
+
     await Promise.all([
       ...transactions.map((t) =>
         Transaction.updateOne({ _id: t._id }, { amount: round2(t.amount * r) })
@@ -81,21 +96,12 @@ router.post("/currency/change", async (req, res) => {
       ...goals.map((g) =>
         Goal.updateOne({ _id: g._id }, { target: round2(g.target * r) })
       ),
-      ...categories.map((c) =>
-        Category.updateOne({ _id: c._id }, { limit: round2(c.limit * r) })
-      ),
-      Settings.updateOne(
-        { userId },
-        {
-          currencyCode: code,
-          exchangeRate: r,
-          monthlyLimit: round2(settings.monthlyLimit * r),
-        }
-      ),
+      ...categories.map((c) => c.save()),
+      settings.save(),
     ]);
 
     const updated = await Settings.findOne({ userId });
-    res.json(updated);
+    res.json(serializeSettings(updated));
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: "serverError" });

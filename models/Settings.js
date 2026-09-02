@@ -1,15 +1,19 @@
 import mongoose from "mongoose";
 
-const settingsSchema = new mongoose.Schema(
+const SettingsSchema = new mongoose.Schema(
   {
-    userId: { type: String, required: true, unique: true, index: true },
-    monthlyLimit: { type: Number, default: 0 },
-    // null until the user completes currency onboarding — mirrors the
-    // frontend's `currency: null` meaning "still onboarding".
-    currencyCode: { type: String, default: null },
+    userId: { type: mongoose.Schema.Types.ObjectId, required: true, unique: true },
+    currencyCode: { type: String },
     exchangeRate: { type: Number, default: 1 },
+    // Overall monthly budget limits, keyed by "YYYY-MM" - same convention
+    // as Category.limits above (no entry = 0).
+    monthlyLimits: {
+      type: Map,
+      of: Number,
+      default: {},
+    },
   },
   { timestamps: true }
 );
 
-export default mongoose.model("Settings", settingsSchema);
+export default mongoose.model("Settings", SettingsSchema);
